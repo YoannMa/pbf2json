@@ -19,12 +19,22 @@ import (
 )
 
 type settings struct {
-	PbfPath    string
-	LevedbPath string
-	Tags       map[string][]string
-	BatchSize  int
-	WayNodes   bool
+	PbfPath         string
+	LeveldbPath     string
+	Tags            map[string][]string
+	BatchSize       int
+	WayNodes        bool
+	RelationMembers bool
 }
+
+type Type string
+
+const (
+	Node     Type = "node"
+	Way      Type = "way"
+	Relation Type = "relation"
+	Unknown  Type = "unknown"
+)
 
 var emptyLatLons = make([]map[string]string, 0)
 
@@ -35,6 +45,7 @@ func getSettings() settings {
 	tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a +")
 	batchSize := flag.Int("batch", 50000, "batch leveldb writes in batches of this size")
 	wayNodes := flag.Bool("waynodes", false, "should the lat/lons of nodes belonging to ways be printed")
+	relationMembers := flag.Bool("relation-members", false, "should relation's members be printed")
 
 	flag.Parse()
 	args := flag.Args()
@@ -57,7 +68,7 @@ func getSettings() settings {
 	// fmt.Print(conditions, len(conditions))
 	// os.Exit(1)
 
-	return settings{args[0], *leveldbPath, conditions, *batchSize, *wayNodes}
+	return settings{args[0], *leveldbPath, conditions, *batchSize, *wayNodes, *relationMembers}
 }
 
 func main() {
@@ -73,11 +84,11 @@ func main() {
 	// we record a bitmask of the interesting elements in the
 	// file, on the second pass we extract the data
 
-	// set up bimasks
+	// set up bitmasks
 	var masks = NewBitmaskMap()
 
 	// set up leveldb connection
-	var db = openLevelDB(config.LevedbPath)
+	var db = openLevelDB(config.LeveldbPath)
 	defer db.Close()
 
 	// === first pass (indexing) ===
@@ -371,7 +382,7 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 					v.Tags = trimTags(v.Tags)
 
 					// print relation
-					onRelation(v, centroid, bounds)
+					onRelation(v, centroid, bounds, config)
 				}
 
 			default:
@@ -383,7 +394,7 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 	}
 }
 
-// lookup all latlons for all ways in relation
+// lookup all latlons for every way in a relation
 func findMemberWayLatLons(db *leveldb.DB, v *osmpbf.Relation) [][]map[string]string {
 	var memberWayLatLons [][]map[string]string
 
@@ -407,21 +418,21 @@ func findMemberWayLatLons(db *leveldb.DB, v *osmpbf.Relation) [][]map[string]str
 
 type jsonNode struct {
 	ID   int64             `json:"id"`
-	Type string            `json:"type"`
+	Type Type              `json:"type"`
 	Lat  float64           `json:"lat"`
 	Lon  float64           `json:"lon"`
 	Tags map[string]string `json:"tags"`
 }
 
 func onNode(node *osmpbf.Node) {
-	marshall := jsonNode{node.ID, "node", node.Lat, node.Lon, node.Tags}
+	marshall := jsonNode{node.ID, Node, node.Lat, node.Lon, node.Tags}
 	json, _ := json.Marshal(marshall)
 	fmt.Println(string(json))
 }
 
 type jsonWay struct {
 	ID   int64             `json:"id"`
-	Type string            `json:"type"`
+	Type Type              `json:"type"`
 	Tags map[string]string `json:"tags"`
 	// NodeIDs   []int64             `json:"refs"`
 	Centroid map[string]string   `json:"centroid"`
@@ -442,22 +453,57 @@ func jsonBbox(bounds *geo.Bound) map[string]string {
 
 func onWay(way *osmpbf.Way, latlons []map[string]string, centroid map[string]string, bounds *geo.Bound) {
 	bbox := jsonBbox(bounds)
-	marshall := jsonWay{way.ID, "way", way.Tags /*, way.NodeIDs*/, centroid, bbox, latlons}
+	marshall := jsonWay{way.ID, Way, way.Tags /*, way.NodeIDs*/, centroid, bbox, latlons}
 	json, _ := json.Marshal(marshall)
 	fmt.Println(string(json))
 }
 
-type jsonRelation struct {
-	ID       int64             `json:"id"`
-	Type     string            `json:"type"`
-	Tags     map[string]string `json:"tags"`
-	Centroid map[string]string `json:"centroid"`
-	Bounds   map[string]string `json:"bounds"`
+type jsonRelationMember struct {
+	ID   int64  `json:"id"`
+	Type Type   `json:"type"`
+	Role string `json:"role"`
 }
 
-func onRelation(relation *osmpbf.Relation, centroid map[string]string, bounds *geo.Bound) {
+type jsonRelation struct {
+	ID       int64                `json:"id"`
+	Type     Type                 `json:"type"`
+	Tags     map[string]string    `json:"tags"`
+	Centroid map[string]string    `json:"centroid"`
+	Bounds   map[string]string    `json:"bounds"`
+	Members  []jsonRelationMember `json:"members,omitempty"`
+}
+
+func relationMemberTypeToType(member osmpbf.MemberType) Type {
+
+	switch member {
+	case osmpbf.NodeType:
+		return Node
+	case osmpbf.WayType:
+		return Way
+	case osmpbf.RelationType:
+		return Relation
+	default:
+		return Unknown
+	}
+}
+
+func serializeMembers(v *osmpbf.Relation) []jsonRelationMember {
+	var members []jsonRelationMember
+	for _, member := range v.Members {
+		members = append(members, jsonRelationMember{member.ID, relationMemberTypeToType(member.Type), member.Role})
+	}
+	return members
+}
+
+func onRelation(relation *osmpbf.Relation, centroid map[string]string, bounds *geo.Bound, config settings) {
 	bbox := jsonBbox(bounds)
-	marshall := jsonRelation{relation.ID, "relation", relation.Tags, centroid, bbox}
+	members := make([]jsonRelationMember, 0)
+
+	if config.RelationMembers {
+		members = serializeMembers(relation)
+	}
+
+	marshall := jsonRelation{relation.ID, Relation, relation.Tags, centroid, bbox, members}
 	json, _ := json.Marshal(marshall)
 	fmt.Println(string(json))
 }
